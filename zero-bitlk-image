@@ -1,0 +1,139 @@
+#!/usr/bin/python3
+
+import argparse
+import os
+import re
+import struct
+import subprocess
+import sys
+
+DUMP_PATTERN = r"\d+:\s+(?P<type>\D+)\n\s+Offset:\s+(?P<offset>\d+) \[bytes\]\n\s+Size:\s+(?P<size>\d+) \[bytes\]\n"
+FVE_STR = "FVE metadata area"
+HDR_STR = "Volume header"
+
+HEADER_SIZE = 8192
+HEADER_OFFSET = (0, HEADER_SIZE)
+SECTOR_SIZE = 512
+
+MFT_ADDR_OFFSET = 48
+MFT_ADDR_SIZE = 8
+MFT_SIZE_OFFSET = 64
+MFT_SIZE_SIZE = 1
+SECTOR_SIZE_OFFSET = 11
+SECTOR_SIZE_SIZE = 2
+CLUSTER_SIZE_OFFSET = 13
+CLUSTER_SIZE_SIZE = 1
+
+
+def _find_zero_intervals(intervals, mn, mx):
+    next_start = mn
+    for x in intervals:
+        if next_start < x[0]:
+            yield next_start,x[0]
+            next_start = x[1]
+        elif next_start < x[1]:
+            next_start = x[1]
+    if next_start < mx:
+        yield next_start, mx
+
+
+def _parse_args():
+    argparser = argparse.ArgumentParser(description="Zero data parts on a BitLocker test image")
+    argparser.add_argument("-p", "--passphrase", dest="passphrase", action="store",
+                           help="passphrase to open the image")
+    argparser.add_argument("image", action="store", help="image to zero")
+    return argparser.parse_args()
+
+
+def _read_from_device(path, start, count):
+    with open(path, "rb") as f:
+        f.seek(start)
+        data = f.read(count)
+
+    return data
+
+
+def main():
+    args = _parse_args()
+
+    if not os.path.exists(args.image):
+        print("%s doesn't exist." % args.image)
+        sys.exit(1)
+
+    # get FVE metadata offsets from bitlkDump
+    try:
+        dump = subprocess.check_output(["./cryptsetup", "bitlkDump", args.image], encoding="utf-8")
+    except Exception as e:
+        print("Failed to run bitlkDump on given image:\n%s" % str(e))
+        sys.exit(1)
+
+    matches = re.findall(DUMP_PATTERN, dump, re.MULTILINE | re.DOTALL)
+    if not matches:
+        print("Failed to get metadata offsets from the bitlkDump output.")
+        sys.exit(1)
+
+    offsets = []
+    for name, start, size in matches:
+        if name == HDR_STR and int(size) > HEADER_SIZE:
+            # for VFAT To Go images the header size is too large, we can truncate it
+            offsets.append((int(start), int(start) + 512))
+        else:
+            offsets.append((int(start), int(start) + int(size)))
+
+    offsets.append(HEADER_OFFSET)
+
+    # if we have passphrase, open the image and get location of the first MFT header from the NTFS header
+    if args.passphrase:
+        ret = subprocess.run("echo \"%s\" | ./cryptsetup bitlkOpen %s %s -" % (args.passphrase, args.image, args.image),
+                             shell=True, check=False)
+        if ret.returncode != 0:
+            print("Failed to open image using provided passphrase")
+            sys.exit(1)
+
+        try:
+            fs = subprocess.check_output(["lsblk", "-n",  "-o", "FSTYPE", "/dev/mapper/%s" % args.image],
+                                         encoding="utf-8")
+        except Exception as e:
+            print("Failed to get filesystem type for opened image:\n%s" % str(e))
+            sys.exit(1)
+
+        if fs.strip() == "ntfs":
+            ntfs_header = _read_from_device("/dev/mapper/%s" % args.image, 0, 512)
+            ssize = struct.unpack("<H", ntfs_header[SECTOR_SIZE_OFFSET:SECTOR_SIZE_OFFSET + SECTOR_SIZE_SIZE])[0]
+            csize = struct.unpack("<B", ntfs_header[CLUSTER_SIZE_OFFSET:CLUSTER_SIZE_OFFSET + CLUSTER_SIZE_SIZE])[0]
+            mft_addr = struct.unpack("<Q", ntfs_header[MFT_ADDR_OFFSET:MFT_ADDR_OFFSET + MFT_ADDR_SIZE])[0]
+            mft_size = struct.unpack("<b", ntfs_header[MFT_SIZE_OFFSET:MFT_SIZE_OFFSET + MFT_SIZE_SIZE])[0]
+            if mft_size < 0:
+                mft_size = 1 << (0 - mft_size)
+
+            mft_cluster_offset = mft_addr * ssize * csize
+            offsets.append((mft_cluster_offset, mft_cluster_offset + mft_size))
+            offsets.append((mft_cluster_offset + 3 * mft_size,
+                            mft_cluster_offset + 3 * mft_size + mft_size))
+
+        ret = subprocess.run(["./cryptsetup", "close", "/dev/mapper/%s" % args.image], check=False)
+        if ret.returncode != 0:
+            print("Failed to close the device.")
+            sys.exit(1)
+
+
+    # sort the offsets
+    offsets.sort(key=lambda offset: offset[0])
+    image_size = os.stat(args.image).st_size
+
+    print(offsets)
+
+    # find intervals to zero (everything NOT in the offsets)
+    zeroes = list(_find_zero_intervals(offsets, 0, image_size))
+
+    # dd from /dev/zero
+    for zero in zeroes:
+        start = zero[0] / SECTOR_SIZE
+        size = (zero[1] - zero[0]) / SECTOR_SIZE
+        subprocess.run(["dd", "if=/dev/zero", "of=%s" % args.image, "count=512",
+                       "bs=512", "count=%d" % size, "seek=%d" % start,
+                       "conv=notrunc"])
+
+
+if __name__ == "__main__":
+    main()
