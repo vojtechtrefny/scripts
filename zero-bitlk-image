@@ -17,6 +17,7 @@ SECTOR_SIZE = 512
 
 MFT_ADDR_OFFSET = 48
 MFT_ADDR_SIZE = 8
+MFT_MIRROR_ADDR_OFFSET = 56
 MFT_SIZE_OFFSET = 64
 MFT_SIZE_SIZE = 1
 SECTOR_SIZE_OFFSET = 11
@@ -102,6 +103,7 @@ def main():
             ssize = struct.unpack("<H", ntfs_header[SECTOR_SIZE_OFFSET:SECTOR_SIZE_OFFSET + SECTOR_SIZE_SIZE])[0]
             csize = struct.unpack("<B", ntfs_header[CLUSTER_SIZE_OFFSET:CLUSTER_SIZE_OFFSET + CLUSTER_SIZE_SIZE])[0]
             mft_addr = struct.unpack("<Q", ntfs_header[MFT_ADDR_OFFSET:MFT_ADDR_OFFSET + MFT_ADDR_SIZE])[0]
+            mft_mirror_addr = struct.unpack("<Q", ntfs_header[MFT_MIRROR_ADDR_OFFSET:MFT_MIRROR_ADDR_OFFSET + MFT_ADDR_SIZE])[0]
             mft_size = struct.unpack("<b", ntfs_header[MFT_SIZE_OFFSET:MFT_SIZE_OFFSET + MFT_SIZE_SIZE])[0]
             if mft_size < 0:
                 mft_size = 1 << (0 - mft_size)
@@ -110,6 +112,11 @@ def main():
             offsets.append((mft_cluster_offset, mft_cluster_offset + mft_size))
             offsets.append((mft_cluster_offset + 3 * mft_size,
                             mft_cluster_offset + 3 * mft_size + mft_size))
+
+            mft_mirror_cluster_offset = mft_mirror_addr * ssize * csize
+            offsets.append((mft_mirror_cluster_offset, mft_mirror_cluster_offset + mft_size))
+            offsets.append((mft_mirror_cluster_offset + 3 * mft_size,
+                            mft_mirror_cluster_offset + 3 * mft_size + mft_size))
 
         ret = subprocess.run(["./cryptsetup", "close", "/dev/mapper/%s" % args.image], check=False)
         if ret.returncode != 0:
