@@ -141,6 +141,9 @@ def main():
                        "bs=512", "count=%d" % size, "seek=%d" % start,
                        "conv=notrunc"])
 
+    print("The image was successfully zeroed. Make sure to also run 'fallocate -d' to deallocate the empty space.")
+    print("To archive the images use 'tar -Scf bitlk-images.tar bitlk-images' and 'xz -9 bitlk-images.tar'")
+
 
 if __name__ == "__main__":
     main()
